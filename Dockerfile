@@ -1,0 +1,13 @@
+FROM python:3.14.3-alpine3.23
+
+WORKDIR /opt/barbara-app
+
+ARG BARBARA_GIT_SHA_SHORT=""
+ENV BARBARA_GIT_SHA_SHORT=${BARBARA_GIT_SHA_SHORT}
+
+ARG BARBARA_APP_VERSION=""
+ENV BARBARA_APP_VERSION=${BARBARA_APP_VERSION}
+
+COPY app /opt/barbara-app/app
+
+CMD ["python", "app/main.py"]

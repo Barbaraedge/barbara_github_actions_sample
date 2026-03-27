@@ -1,0 +1,338 @@
+name: CI/CD
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  REGISTRY_HOST: ${{ vars.REGISTRY_HOST }}
+  REGISTRY_NAMESPACE: ${{ vars.REGISTRY_NAMESPACE }}
+  IMAGE_NAME: ${{ vars.IMAGE_NAME }}
+  APP_NAME: ${{ vars.APP_NAME }}
+  APP_VERSION_ARCHITECTURES: ${{ vars.APP_VERSION_ARCHITECTURES }}
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    container:
+      image: python:3.14.3-alpine3.23
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+  validate-deployment-targets:
+    runs-on: ubuntu-24.04
+    environment: production
+    container:
+      image: python:3.14.3-alpine3.23
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Validate deployment targets against Barbara
+        env:
+          BARBARA_API_URL: ${{ vars.BARBARA_API_URL }}
+          BARBARA_AUTH_URL: ${{ vars.BARBARA_AUTH_URL }}
+          BARBARA_KEYCLOAK_REALM: ${{ vars.BARBARA_KEYCLOAK_REALM }}
+          BARBARA_KEYCLOAK_CLIENT_ID: ${{ vars.BARBARA_KEYCLOAK_CLIENT_ID }}
+          BARBARA_KEYCLOAK_USER_EMAIL: ${{ vars.BARBARA_KEYCLOAK_USER_EMAIL }}
+          BARBARA_KEYCLOAK_CLIENT_SECRET: ${{ secrets.BARBARA_KEYCLOAK_CLIENT_SECRET }}
+          BARBARA_KEYCLOAK_USER_PASSWORD: ${{ secrets.BARBARA_KEYCLOAK_USER_PASSWORD }}
+        run: python scripts/resolve_deployment_targets.py
+
+      - name: Upload resolved deployment targets
+        uses: actions/upload-artifact@v7
+        with:
+          name: resolved-deployment-targets
+          path: dist/resolved-deployment-targets.json
+          retention-days: 7
+
+  build-image:
+    runs-on: ubuntu-24.04
+    needs:
+      - test
+      - validate-deployment-targets
+    permissions:
+      contents: read
+    outputs:
+      git_sha_short: ${{ steps.vars.outputs.git_sha_short }}
+      version: ${{ steps.vars.outputs.version }}
+      tag_name: ${{ steps.vars.outputs.tag_name }}
+      image_ref: ${{ steps.vars.outputs.image_ref }}
+      asset_name: ${{ steps.vars.outputs.asset_name }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Compute build metadata
+        id: vars
+        shell: bash
+        run: |
+          git_sha_short="${GITHUB_SHA::7}"
+          version="${GITHUB_REF_NAME#v}"
+          image_ref="${REGISTRY_HOST}/${REGISTRY_NAMESPACE}/${IMAGE_NAME}"
+          asset_name="${APP_NAME}-${version}.zip"
+          echo "git_sha_short=$git_sha_short" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          echo "image_ref=$image_ref" >> "$GITHUB_OUTPUT"
+          echo "asset_name=$asset_name" >> "$GITHUB_OUTPUT"
+          echo "Image: $image_ref:$git_sha_short"
+          echo "Version: $version"
+
+      - name: Resolve Docker platforms
+        id: platforms
+        shell: bash
+        run: |
+          raw_architectures="${APP_VERSION_ARCHITECTURES}"
+          if [[ -z "${raw_architectures}" ]]; then
+            raw_architectures="x86_64"
+          fi
+
+          declare -a docker_platforms=()
+          IFS=',' read -ra requested_architectures <<< "${raw_architectures}"
+          for raw_arch in "${requested_architectures[@]}"; do
+            arch="$(echo "${raw_arch}" | xargs)"
+            case "${arch}" in
+              x86_64)  docker_platforms+=("linux/amd64") ;;
+              arm64)   docker_platforms+=("linux/arm64") ;;
+              armv7)   docker_platforms+=("linux/arm/v7") ;;
+              *)       echo "Ignoring unsupported architecture: ${arch}" ;;
+            esac
+          done
+
+          if [[ ${#docker_platforms[@]} -eq 0 ]]; then
+            docker_platforms=("linux/amd64")
+          fi
+
+          unique_platforms="$(printf '%s\n' "${docker_platforms[@]}" | awk '!seen[$0]++' | paste -sd, -)"
+          echo "platforms=${unique_platforms}" >> "$GITHUB_OUTPUT"
+          echo "Platforms: ${unique_platforms}"
+
+      - name: Compute image tags
+        id: tags
+        shell: bash
+        run: |
+          {
+            echo "tags<<EOF"
+            echo "${{ steps.vars.outputs.image_ref }}:${{ steps.vars.outputs.git_sha_short }}"
+            echo "${{ steps.vars.outputs.image_ref }}:latest"
+            echo "${{ steps.vars.outputs.image_ref }}:${{ steps.vars.outputs.version }}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Tags:"
+          echo "${{ steps.vars.outputs.image_ref }}:${{ steps.vars.outputs.git_sha_short }}"
+          echo "${{ steps.vars.outputs.image_ref }}:latest"
+          echo "${{ steps.vars.outputs.image_ref }}:${{ steps.vars.outputs.version }}"
+
+      - name: Login to container registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY_HOST }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push multi-platform Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          platforms: ${{ steps.platforms.outputs.platforms }}
+          build-args: |
+            BARBARA_GIT_SHA_SHORT=${{ steps.vars.outputs.git_sha_short }}
+            BARBARA_APP_VERSION=${{ steps.vars.outputs.version }}
+          tags: ${{ steps.tags.outputs.tags }}
+
+  package-artifact:
+    runs-on: ubuntu-24.04
+    needs: build-image
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Create deployable docker-compose.yaml
+        shell: bash
+        run: |
+          python scripts/package_docker_compose.py \
+            "${{ needs.build-image.outputs.image_ref }}:${{ needs.build-image.outputs.git_sha_short }}" \
+            docker-compose.yaml \
+            dist/docker-compose.yaml
+
+      - name: Show release artifact content
+        shell: bash
+        run: cat dist/docker-compose.yaml
+
+      - name: Package release artifact
+        shell: bash
+        run: |
+          cd dist
+          zip -q "${{ needs.build-image.outputs.asset_name }}" docker-compose.yaml
+          echo "Packaged: ${{ needs.build-image.outputs.asset_name }} ($(du -sh "${{ needs.build-image.outputs.asset_name }}" | cut -f1))"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-artifact
+          path: dist/${{ needs.build-image.outputs.asset_name }}
+          retention-days: 1
+
+  register-barbara-application:
+    runs-on: ubuntu-24.04
+    needs: build-image
+    environment: production
+    container:
+      image: python:3.14.3-alpine3.23
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Ensure Barbara application exists
+        env:
+          APP_NAME: ${{ vars.APP_NAME }}
+          APP_DEVELOPER: ${{ vars.APP_DEVELOPER }}
+          APP_SHORT_DESCRIPTION: ${{ vars.APP_SHORT_DESCRIPTION }}
+          APP_LONG_DESCRIPTION: ${{ vars.APP_LONG_DESCRIPTION }}
+          BARBARA_API_URL: ${{ vars.BARBARA_API_URL }}
+          BARBARA_AUTH_URL: ${{ vars.BARBARA_AUTH_URL }}
+          BARBARA_KEYCLOAK_REALM: ${{ vars.BARBARA_KEYCLOAK_REALM }}
+          BARBARA_KEYCLOAK_CLIENT_ID: ${{ vars.BARBARA_KEYCLOAK_CLIENT_ID }}
+          BARBARA_KEYCLOAK_USER_EMAIL: ${{ vars.BARBARA_KEYCLOAK_USER_EMAIL }}
+          BARBARA_KEYCLOAK_CLIENT_SECRET: ${{ secrets.BARBARA_KEYCLOAK_CLIENT_SECRET }}
+          BARBARA_KEYCLOAK_USER_PASSWORD: ${{ secrets.BARBARA_KEYCLOAK_USER_PASSWORD }}
+        run: python scripts/ensure_barbara_application.py
+
+  upload-barbara-version:
+    runs-on: ubuntu-24.04
+    needs:
+      - build-image
+      - package-artifact
+      - register-barbara-application
+    environment: production
+    container:
+      image: python:3.14.3-alpine3.23
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Download release artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: release-artifact
+          path: dist
+
+      - name: Upload app version to Barbara
+        env:
+          APP_NAME: ${{ vars.APP_NAME }}
+          APP_VERSION_NAME: ${{ needs.build-image.outputs.version }}
+          APP_VERSION_ARTIFACT_PATH: dist/${{ needs.build-image.outputs.asset_name }}
+          APP_VERSION_ARCHITECTURES: ${{ vars.APP_VERSION_ARCHITECTURES }}
+          APP_VERSION_RELEASE_NOTES: Release ${{ needs.build-image.outputs.version }}
+          BARBARA_API_URL: ${{ vars.BARBARA_API_URL }}
+          BARBARA_AUTH_URL: ${{ vars.BARBARA_AUTH_URL }}
+          BARBARA_KEYCLOAK_REALM: ${{ vars.BARBARA_KEYCLOAK_REALM }}
+          BARBARA_KEYCLOAK_CLIENT_ID: ${{ vars.BARBARA_KEYCLOAK_CLIENT_ID }}
+          BARBARA_KEYCLOAK_USER_EMAIL: ${{ vars.BARBARA_KEYCLOAK_USER_EMAIL }}
+          BARBARA_KEYCLOAK_CLIENT_SECRET: ${{ secrets.BARBARA_KEYCLOAK_CLIENT_SECRET }}
+          BARBARA_KEYCLOAK_USER_PASSWORD: ${{ secrets.BARBARA_KEYCLOAK_USER_PASSWORD }}
+        run: python scripts/upload_barbara_app_version.py
+
+  deploy-to-devices:
+    runs-on: ubuntu-24.04
+    needs:
+      - build-image
+      - upload-barbara-version
+    environment: production
+    container:
+      image: python:3.14.3-alpine3.23
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Show deployment targets
+        run: cat deployment-targets.json
+
+      - name: Deploy app version to devices
+        env:
+          APP_NAME: ${{ vars.APP_NAME }}
+          APP_VERSION_NAME: ${{ needs.build-image.outputs.version }}
+          BARBARA_API_URL: ${{ vars.BARBARA_API_URL }}
+          BARBARA_AUTH_URL: ${{ vars.BARBARA_AUTH_URL }}
+          BARBARA_KEYCLOAK_REALM: ${{ vars.BARBARA_KEYCLOAK_REALM }}
+          BARBARA_KEYCLOAK_CLIENT_ID: ${{ vars.BARBARA_KEYCLOAK_CLIENT_ID }}
+          BARBARA_KEYCLOAK_USER_EMAIL: ${{ vars.BARBARA_KEYCLOAK_USER_EMAIL }}
+          BARBARA_KEYCLOAK_CLIENT_SECRET: ${{ secrets.BARBARA_KEYCLOAK_CLIENT_SECRET }}
+          BARBARA_KEYCLOAK_USER_PASSWORD: ${{ secrets.BARBARA_KEYCLOAK_USER_PASSWORD }}
+        run: python scripts/deploy_barbara_app_version.py
+
+  verify-deployment:
+    runs-on: ubuntu-24.04
+    needs:
+      - build-image
+      - deploy-to-devices
+    environment: production
+    container:
+      image: python:3.14.3-alpine3.23
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Verify deployment health and rollback if needed
+        env:
+          APP_NAME: ${{ vars.APP_NAME }}
+          APP_VERSION_NAME: ${{ needs.build-image.outputs.version }}
+          APP_VERSION_IMAGE_REF: ${{ needs.build-image.outputs.image_ref }}:${{ needs.build-image.outputs.git_sha_short }}
+          VERIFY_TIMEOUT_SECONDS: ${{ vars.VERIFY_TIMEOUT_SECONDS }}
+          VERIFY_INTERVAL_SECONDS: ${{ vars.VERIFY_INTERVAL_SECONDS }}
+          BARBARA_API_URL: ${{ vars.BARBARA_API_URL }}
+          BARBARA_AUTH_URL: ${{ vars.BARBARA_AUTH_URL }}
+          BARBARA_KEYCLOAK_REALM: ${{ vars.BARBARA_KEYCLOAK_REALM }}
+          BARBARA_KEYCLOAK_CLIENT_ID: ${{ vars.BARBARA_KEYCLOAK_CLIENT_ID }}
+          BARBARA_KEYCLOAK_USER_EMAIL: ${{ vars.BARBARA_KEYCLOAK_USER_EMAIL }}
+          BARBARA_KEYCLOAK_CLIENT_SECRET: ${{ secrets.BARBARA_KEYCLOAK_CLIENT_SECRET }}
+          BARBARA_KEYCLOAK_USER_PASSWORD: ${{ secrets.BARBARA_KEYCLOAK_USER_PASSWORD }}
+        run: python scripts/verify_deployment.py
+
+  create-github-release:
+    runs-on: ubuntu-latest
+    needs:
+      - build-image
+      - verify-deployment
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: release-artifact
+          path: dist
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          gh release create "${{ needs.build-image.outputs.tag_name }}" \
+            "dist/${{ needs.build-image.outputs.asset_name }}" \
+            --repo "${{ github.repository }}" \
+            --title "Release ${{ needs.build-image.outputs.tag_name }}" \
+            --generate-notes
